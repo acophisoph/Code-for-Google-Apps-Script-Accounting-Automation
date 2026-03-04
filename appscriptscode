@@ -1,0 +1,161 @@
+/**
+ * AUTO-EXTRACT RECEIPTS (V6 - High Volume Fix)
+ */
+
+const API_KEY = ''; 
+const ROOT_FOLDER_ID = ''; 
+const MASTER_SHEET_ID = ''; 
+
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('🚀 Receipt Tools')
+    .addItem('Sync All Folders', 'processAllFolders')
+    .addToUi();
+}
+
+function processAllFolders() {
+  const rootFolder = DriveApp.getFolderById(ROOT_FOLDER_ID);
+  const masterSheet = SpreadsheetApp.openById(MASTER_SHEET_ID).getActiveSheet();
+  traverseFolders(rootFolder, masterSheet, null);
+  SpreadsheetApp.getUi().alert('Sync Complete!');
+}
+
+function traverseFolders(currentFolder, masterSheet, yearSheetId) {
+  const folderName = currentFolder.getName();
+  let currentYearSheetId = yearSheetId;
+
+  if (folderName.includes('年')) {
+    currentYearSheetId = getOrCreateSheetInFolder(currentFolder, `Tax Sheet ${folderName}`);
+  }
+  
+  if (folderName.includes('月')) {
+    const monthSheetId = getOrCreateSheetInFolder(currentFolder, `Tax Sheet ${folderName}`);
+    processFilesInMemory(currentFolder, masterSheet, currentYearSheetId, monthSheetId);
+  }
+
+  const subfolders = currentFolder.getFolders();
+  while (subfolders.hasNext()) {
+    const sub = subfolders.next();
+    if (sub.getName() !== "Processed") {
+      traverseFolders(sub, masterSheet, currentYearSheetId);
+    }
+  }
+}
+
+function processFilesInMemory(folder, masterSheet, yearSheetId, monthSheetId) {
+  const files = folder.getFiles();
+  const processedFolder = getProcessedSubFolder(folder);
+  
+  // Define supported formats
+  const allowedTypes = [
+    "application/pdf", 
+    "image/jpeg", 
+    "image/png", 
+    "text/plain", 
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  ];
+
+  while (files.hasNext()) {
+    const file = files.next();
+    const mimeType = file.getMimeType();
+    const fileName = file.getName();
+    
+    if (fileName.includes("Tax Sheet") || fileName === "Processed") continue;
+    if (!allowedTypes.includes(mimeType)) continue;
+
+    try {
+      console.log("Found file: " + fileName);
+      let contentData;
+
+      if (mimeType === "text/plain") {
+        contentData = { text: scrubText(file.getBlob().getDataAsString()) };
+      } 
+      else if (mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+        contentData = { text: scrubText(extractDocxText(file.getId())) };
+      } 
+      else {
+        contentData = { inline_data: { mime_type: mimeType, data: Utilities.base64Encode(file.getBlob().getBytes()) } };
+      }
+
+      const data = callGeminiAI(contentData);
+      
+      if (data) {
+        const row = [data.date, data.category, data.vendor, data.total_amount, data.tax_amount, data.currency, file.getUrl()];
+
+        // Batch update to all applicable sheets
+        SpreadsheetApp.openById(monthSheetId).getActiveSheet().appendRow(row);
+        if (yearSheetId) SpreadsheetApp.openById(yearSheetId).getActiveSheet().appendRow(row);
+        masterSheet.appendRow(row);
+
+        // IMMEDIATE MOVE: Prevents re-processing if script hits time limit later
+        file.moveTo(processedFolder);
+        console.log("Successfully moved: " + fileName);
+        
+        // Brief pause to stay under Gemini RPM (Rate Per Minute) limits
+        Utilities.sleep(1000); 
+      }
+    } catch (err) {
+      console.error("Error on " + fileName + ": " + err);
+      // Continue to next file even if one fails
+    }
+  }
+}
+
+/**
+ * FIXED DOCX EXTRACTION: Uses a more stable conversion method
+ */
+function extractDocxText(fileId) {
+  const file = DriveApp.getFileById(fileId);
+  const resource = {
+    title: "Temp_" + file.getName(),
+    mimeType: MimeType.GOOGLE_DOCS
+  };
+  // More stable Drive API v2 syntax
+  const tempFile = Drive.Files.copy(resource, fileId); 
+  const doc = DocumentApp.openById(tempFile.id);
+  const text = doc.getBody().getText();
+  Drive.Files.remove(tempFile.id); // Permanent delete
+  return text;
+}
+
+function callGeminiAI(contentPart) {
+  const modelId = "gemini-3-flash-preview"; // Use stable 1.5 Flash for high volume/OCR
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${API_KEY}`;
+  
+  const taxCategories = "Office Supplies, Travel, Meals & Entertainment, Advertising, Utilities, Rent, Software/Subscriptions, Repairs, Shipping, Contract Labor, Taxes and Licenses, Legal and Professional Insurances";
+  const prompt = `Return ONLY JSON: {date(YYYY-MM-DD), category, vendor, total_amount(number), tax_amount(number), currency(3-letter code)}. Categories: ${taxCategories}. If values are missing, use null. No markdown, no extra text`;
+  
+  const payload = { contents: [{ parts: [ { text: prompt }, contentPart ] }] };
+  const options = { method: "POST", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true };
+
+  const res = UrlFetchApp.fetch(url, options);
+  const json = JSON.parse(res.getContentText());
+  
+  if (json.error) {
+    console.error("Gemini Error: " + json.error.message);
+    return null;
+  }
+
+  try {
+    const text = json.candidates[0].content.parts[0].text;
+    return JSON.parse(text.replace(/```json|```/g, ""));
+  } catch (e) { return null; }
+}
+
+// --- KEEP OTHER HELPERS (getOrCreateSheetInFolder, getProcessedSubFolder, scrubText) ---
+function getOrCreateSheetInFolder(folder, sheetName) {
+  const existing = folder.getFilesByName(sheetName);
+  if (existing.hasNext()) return existing.next().getId();
+  const newSS = SpreadsheetApp.create(sheetName);
+  DriveApp.getFileById(newSS.getId()).moveTo(folder);
+  newSS.getActiveSheet().appendRow(["Date", "Category", "Vendor", "Total", "Tax", "Currency", "Link"]);
+  return newSS.getId();
+}
+
+function getProcessedSubFolder(parent) {
+  const folders = parent.getFoldersByName("Processed");
+  return folders.hasNext() ? folders.next() : parent.createFolder("Processed");
+}
+
+function scrubText(text) {
+  return text ? text.replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[SSN]").replace(/\b(?:\d[ -]*?){13,16}\b/g, "[CARD]").replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[EMAIL]") : "";
+}

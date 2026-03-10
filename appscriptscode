@@ -1,161 +1,291 @@
 /**
- * AUTO-EXTRACT RECEIPTS (V6 - High Volume Fix)
+ * AUTO-EXTRACT RECEIPTS V7 — JAPANESE ACCOUNTING (JA)
+ *
+ * FOLDER STRUCTURE REQUIRED:
+ *   Root Folder/
+ *     └── [法人名 / 口座名] (account name)
+ *           └── [YYYY年] (year folder, e.g. "2024年")
+ *                 └── [MM月] (month folder, e.g. "04月")
+ *                       └── [領収書ファイルをここに]
+ *
+ * MASTER SHEET: 空白のGoogleスプレッドシートを作成しIDを MASTER_SHEET_ID に入力。
+ * 年・月フォルダ内のTaxシートはスクリプトが自動生成します。
+ *
+ * SETUP STEPS:
+ *  1. 上記のフォルダ構造をGoogleドライブに作成する。
+ *  2. 空白のGoogleスプレッドシートをマスタ用に作成する。
+ *  3. 以下の API_KEY, ROOT_FOLDER_ID, MASTER_SHEET_ID を入力する。
+ *  4. Apps Script > サービス で Drive API v2 を有効にする。
+ *  5. processAllFolders() を実行またはメニューから起動する。
  */
 
-const API_KEY = ''; 
-const ROOT_FOLDER_ID = ''; 
-const MASTER_SHEET_ID = ''; 
+const API_KEY         = '';   // Gemini APIキー
+const ROOT_FOLDER_ID  = '';   // ルートフォルダのID
+const MASTER_SHEET_ID = '';   // マスタシートのID
+
+// ─── UI ──────────────────────────────────────────────────────────────────────
 
 function onOpen() {
-  SpreadsheetApp.getUi().createMenu('🚀 Receipt Tools')
-    .addItem('Sync All Folders', 'processAllFolders')
+  SpreadsheetApp.getUi()
+    .createMenu('🚀 経費ツール')
+    .addItem('全フォルダを同期', 'processAllFolders')
     .addToUi();
 }
 
+// ─── ENTRY POINT ─────────────────────────────────────────────────────────────
+
 function processAllFolders() {
-  const rootFolder = DriveApp.getFolderById(ROOT_FOLDER_ID);
-  const masterSheet = SpreadsheetApp.openById(MASTER_SHEET_ID).getActiveSheet();
-  traverseFolders(rootFolder, masterSheet, null);
-  SpreadsheetApp.getUi().alert('Sync Complete!');
+  const rootFolder  = DriveApp.getFolderById(ROOT_FOLDER_ID);
+  const masterSS    = SpreadsheetApp.openById(MASTER_SHEET_ID);
+  const masterSheet = masterSS.getActiveSheet();
+
+  ensureHeaders(masterSheet, JA_HEADERS);
+
+  const processedIds = loadProcessedIds(masterSS);
+
+  traverseFolders(rootFolder, masterSheet, masterSS, null, processedIds);
+  SpreadsheetApp.getUi().alert('✅ 同期が完了しました！');
 }
 
-function traverseFolders(currentFolder, masterSheet, yearSheetId) {
-  const folderName = currentFolder.getName();
-  let currentYearSheetId = yearSheetId;
+// ─── HEADERS ─────────────────────────────────────────────────────────────────
+
+const JA_HEADERS = ['取引日', '勘定科目', '取引先', '合計金額', '消費税額', '通貨', 'リンク', 'ファイルID'];
+
+// ─── TRAVERSAL ───────────────────────────────────────────────────────────────
+
+function traverseFolders(currentFolder, masterSheet, masterSS, yearSheetId, processedIds) {
+  const folderName        = currentFolder.getName();
+  let   currentYearSheetId = yearSheetId;
 
   if (folderName.includes('年')) {
-    currentYearSheetId = getOrCreateSheetInFolder(currentFolder, `Tax Sheet ${folderName}`);
+    currentYearSheetId = getOrCreateSheetInFolder(
+      currentFolder, `経費明細 ${folderName}`, JA_HEADERS
+    );
   }
-  
+
   if (folderName.includes('月')) {
-    const monthSheetId = getOrCreateSheetInFolder(currentFolder, `Tax Sheet ${folderName}`);
-    processFilesInMemory(currentFolder, masterSheet, currentYearSheetId, monthSheetId);
+    const monthSheetId = getOrCreateSheetInFolder(
+      currentFolder, `経費明細 ${folderName}`, JA_HEADERS
+    );
+    processFilesInMemory(
+      currentFolder, masterSheet, masterSS,
+      currentYearSheetId, monthSheetId, processedIds
+    );
   }
 
   const subfolders = currentFolder.getFolders();
   while (subfolders.hasNext()) {
     const sub = subfolders.next();
-    if (sub.getName() !== "Processed") {
-      traverseFolders(sub, masterSheet, currentYearSheetId);
+    if (sub.getName() !== '処理済み') {
+      traverseFolders(sub, masterSheet, masterSS, currentYearSheetId, processedIds);
     }
   }
 }
 
-function processFilesInMemory(folder, masterSheet, yearSheetId, monthSheetId) {
-  const files = folder.getFiles();
+// ─── FILE PROCESSING ─────────────────────────────────────────────────────────
+
+function processFilesInMemory(folder, masterSheet, masterSS, yearSheetId, monthSheetId, processedIds) {
+  const allowedTypes = new Set([
+    'application/pdf',
+    'image/jpeg',
+    'image/png',
+    'text/plain',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  ]);
+
+  const monthSS    = SpreadsheetApp.openById(monthSheetId);
+  const monthSheet = monthSS.getActiveSheet();
+  const yearSheet  = yearSheetId
+    ? SpreadsheetApp.openById(yearSheetId).getActiveSheet()
+    : null;
+
+  ensureHeaders(monthSheet, JA_HEADERS);
+  if (yearSheet) ensureHeaders(yearSheet, JA_HEADERS);
+
+  const masterRows = [];
+  const monthRows  = [];
+  const yearRows   = [];
+
   const processedFolder = getProcessedSubFolder(folder);
-  
-  // Define supported formats
-  const allowedTypes = [
-    "application/pdf", 
-    "image/jpeg", 
-    "image/png", 
-    "text/plain", 
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-  ];
+  const files = folder.getFiles();
 
   while (files.hasNext()) {
-    const file = files.next();
+    const file     = files.next();
+    const fileId   = file.getId();
     const mimeType = file.getMimeType();
     const fileName = file.getName();
-    
-    if (fileName.includes("Tax Sheet") || fileName === "Processed") continue;
-    if (!allowedTypes.includes(mimeType)) continue;
+
+    if (fileName.includes('経費明細') || fileName === '処理済み') continue;
+    if (!allowedTypes.has(mimeType))                               continue;
+
+    if (processedIds.has(fileId)) {
+      console.log(`スキップ（処理済み）: ${fileName}`);
+      continue;
+    }
 
     try {
-      console.log("Found file: " + fileName);
-      let contentData;
+      console.log(`処理中: ${fileName}`);
 
-      if (mimeType === "text/plain") {
+      let contentData;
+      if (mimeType === 'text/plain') {
         contentData = { text: scrubText(file.getBlob().getDataAsString()) };
-      } 
-      else if (mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
-        contentData = { text: scrubText(extractDocxText(file.getId())) };
-      } 
-      else {
-        contentData = { inline_data: { mime_type: mimeType, data: Utilities.base64Encode(file.getBlob().getBytes()) } };
+      } else if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+        contentData = { text: scrubText(extractDocxText(fileId)) };
+      } else {
+        contentData = {
+          inline_data: {
+            mime_type: mimeType,
+            data: Utilities.base64Encode(file.getBlob().getBytes())
+          }
+        };
       }
 
       const data = callGeminiAI(contentData);
-      
+
       if (data) {
-        const row = [data.date, data.category, data.vendor, data.total_amount, data.tax_amount, data.currency, file.getUrl()];
+        const masterRow = [data.date, data.category, data.vendor,
+                           data.total_amount, data.tax_amount, data.currency,
+                           file.getUrl(), fileId];
+        const subRow    = masterRow.slice(0, 7);
 
-        // Batch update to all applicable sheets
-        SpreadsheetApp.openById(monthSheetId).getActiveSheet().appendRow(row);
-        if (yearSheetId) SpreadsheetApp.openById(yearSheetId).getActiveSheet().appendRow(row);
-        masterSheet.appendRow(row);
+        masterRows.push(masterRow);
+        monthRows.push(subRow);
+        if (yearSheet) yearRows.push(subRow);
 
-        // IMMEDIATE MOVE: Prevents re-processing if script hits time limit later
+        processedIds.add(fileId);
         file.moveTo(processedFolder);
-        console.log("Successfully moved: " + fileName);
-        
-        // Brief pause to stay under Gemini RPM (Rate Per Minute) limits
-        Utilities.sleep(1000); 
+        console.log(`移動完了: ${fileName}`);
       }
+
+      Utilities.sleep(1000);
+
     } catch (err) {
-      console.error("Error on " + fileName + ": " + err);
-      // Continue to next file even if one fails
+      console.error(`エラー (${fileName}): ${err}`);
     }
   }
+
+  batchAppend(masterSheet, masterRows);
+  batchAppend(monthSheet,  monthRows);
+  if (yearSheet && yearRows.length) batchAppend(yearSheet, yearRows);
 }
 
-/**
- * FIXED DOCX EXTRACTION: Uses a more stable conversion method
- */
-function extractDocxText(fileId) {
-  const file = DriveApp.getFileById(fileId);
-  const resource = {
-    title: "Temp_" + file.getName(),
-    mimeType: MimeType.GOOGLE_DOCS
-  };
-  // More stable Drive API v2 syntax
-  const tempFile = Drive.Files.copy(resource, fileId); 
-  const doc = DocumentApp.openById(tempFile.id);
-  const text = doc.getBody().getText();
-  Drive.Files.remove(tempFile.id); // Permanent delete
-  return text;
-}
+// ─── GEMINI (日本語会計プロンプト) ────────────────────────────────────────────
 
 function callGeminiAI(contentPart) {
-  const modelId = "gemini-3-flash-preview"; // Use stable 1.5 Flash for high volume/OCR
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${API_KEY}`;
-  
-  const taxCategories = "Office Supplies, Travel, Meals & Entertainment, Advertising, Utilities, Rent, Software/Subscriptions, Repairs, Shipping, Contract Labor, Taxes and Licenses, Legal and Professional Insurances";
-  const prompt = `Return ONLY JSON: {date(YYYY-MM-DD), category, vendor, total_amount(number), tax_amount(number), currency(3-letter code)}. Categories: ${taxCategories}. If values are missing, use null. No markdown, no extra text`;
-  
-  const payload = { contents: [{ parts: [ { text: prompt }, contentPart ] }] };
-  const options = { method: "POST", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true };
+  const modelId = 'gemini-3-flash-preview';
+  const url     = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${API_KEY}`;
 
-  const res = UrlFetchApp.fetch(url, options);
+  /**
+   * 勘定科目は日本の法人税法・消費税法に準拠した一般的な科目を使用。
+   * 消費税は税率（8% 軽減 / 10% 標準）を考慮して tax_amount を抽出。
+   * インボイス制度（適格請求書）対応: 登録番号が読み取れる場合は invoice_number に記録。
+   */
+  const categories =
+    '消耗品費, 旅費交通費, 交際費, 広告宣伝費, 水道光熱費, 地代家賃, ' +
+    'ソフトウェア・サブスクリプション費, 修繕費, 通信費, 外注費, ' +
+    '租税公課, 支払手数料, 保険料, 福利厚生費, 雑費';
+
+  const prompt =
+    `以下のレシート・領収書・請求書から情報を抽出し、必ず下記のキーのみを含む有効なJSONを返してください。` +
+    `マークダウン・説明文・余分なテキストは一切含めないこと。\n\n` +
+    `必須キー:\n` +
+    `  date        : 取引日 (YYYY-MM-DD形式)\n` +
+    `  category    : 勘定科目 (下記リストから最も適切なものを選択)\n` +
+    `  vendor      : 取引先名\n` +
+    `  total_amount: 合計金額 (税込、数値のみ)\n` +
+    `  tax_amount  : 消費税額 (数値のみ。軽減税率8%・標準税率10%を考慮)\n` +
+    `  currency    : 通貨コード (ISO 4217、例: JPY)\n` +
+    `  invoice_number: 適格請求書発行事業者登録番号 (例: T1234567890123。不明な場合はnull)\n\n` +
+    `勘定科目リスト: ${categories}\n\n` +
+    `値が不明な場合は null を使用すること。`;
+
+  const payload = { contents: [{ parts: [{ text: prompt }, contentPart] }] };
+  const options = {
+    method: 'POST',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const res  = UrlFetchApp.fetch(url, options);
   const json = JSON.parse(res.getContentText());
-  
+
   if (json.error) {
-    console.error("Gemini Error: " + json.error.message);
+    console.error(`Gemini エラー: ${json.error.message}`);
     return null;
   }
 
   try {
     const text = json.candidates[0].content.parts[0].text;
-    return JSON.parse(text.replace(/```json|```/g, ""));
-  } catch (e) { return null; }
+    return JSON.parse(text.replace(/```json|```/g, '').trim());
+  } catch (e) {
+    console.error(`JSONパースエラー: ${e}`);
+    return null;
+  }
 }
 
-// --- KEEP OTHER HELPERS (getOrCreateSheetInFolder, getProcessedSubFolder, scrubText) ---
-function getOrCreateSheetInFolder(folder, sheetName) {
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+function batchAppend(sheet, rows) {
+  if (!rows.length) return;
+  const lastRow = sheet.getLastRow();
+  sheet.getRange(lastRow + 1, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+function ensureHeaders(sheet, headers) {
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headers);
+  }
+}
+
+function getOrCreateSheetInFolder(folder, sheetName, headers) {
   const existing = folder.getFilesByName(sheetName);
   if (existing.hasNext()) return existing.next().getId();
-  const newSS = SpreadsheetApp.create(sheetName);
-  DriveApp.getFileById(newSS.getId()).moveTo(folder);
-  newSS.getActiveSheet().appendRow(["Date", "Category", "Vendor", "Total", "Tax", "Currency", "Link"]);
+
+  const newSS   = SpreadsheetApp.create(sheetName);
+  const newFile = DriveApp.getFileById(newSS.getId());
+  newFile.moveTo(folder);
+
+  const parents = newFile.getParents();
+  while (parents.hasNext()) {
+    const p = parents.next();
+    if (p.getId() !== folder.getId()) newFile.removeFromFolder(p);
+  }
+
+  newSS.getActiveSheet().appendRow(headers);
   return newSS.getId();
 }
 
+function loadProcessedIds(masterSS) {
+  const sheet   = masterSS.getActiveSheet();
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return new Set();
+  const ids = sheet.getRange(2, 8, lastRow - 1, 1).getValues();
+  return new Set(ids.map(r => r[0]).filter(Boolean));
+}
+
 function getProcessedSubFolder(parent) {
-  const folders = parent.getFoldersByName("Processed");
-  return folders.hasNext() ? folders.next() : parent.createFolder("Processed");
+  const folders = parent.getFoldersByName('処理済み');
+  return folders.hasNext() ? folders.next() : parent.createFolder('処理済み');
+}
+
+function extractDocxText(fileId) {
+  const file     = DriveApp.getFileById(fileId);
+  const resource = { title: `Temp_${file.getName()}`, mimeType: MimeType.GOOGLE_DOCS };
+  const tempFile = Drive.Files.copy(resource, fileId);
+  const doc      = DocumentApp.openById(tempFile.id);
+  const text     = doc.getBody().getText();
+  Drive.Files.remove(tempFile.id);
+  return text;
 }
 
 function scrubText(text) {
-  return text ? text.replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[SSN]").replace(/\b(?:\d[ -]*?){13,16}\b/g, "[CARD]").replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[EMAIL]") : "";
+  return text
+    ? text
+        .replace(/\b\d{3}-\d{2}-\d{4}\b/g,              '[SSN]')
+        .replace(/\b(?:\d[ -]*?){13,16}\b/g,             '[CARD]')
+        .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[EMAIL]')
+        .replace(/\b\d{4}-\d{4}-\d{4}-\d{4}\b/g,        '[CARD]') // Japanese card format
+        .replace(/マイナンバー[：:\s]*\d{12}/g,            '[MYNUM]') // My Number
+    : '';
 }

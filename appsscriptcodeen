@@ -1,0 +1,289 @@
+/**
+ * AUTO-EXTRACT RECEIPTS V7 — ENGLISH
+ *
+ * FOLDER STRUCTURE REQUIRED:
+ *   Root Folder/
+ *     └── [Account Name]/
+ *           └── [YYYY年] (year folder, e.g. "2024年")
+ *                 └── [MM月] (month folder, e.g. "04月")
+ *                       └── [receipt files go here]
+ *
+ * MASTER SHEET: A blank Google Sheet. Paste its ID into MASTER_SHEET_ID.
+ * The script creates all Tax Sheet spreadsheets automatically inside each
+ * year/month folder. You only need to pre-create the empty folder structure.
+ *
+ * SETUP STEPS:
+ *  1. Create the folder structure above in Google Drive.
+ *  2. Create a blank Google Sheet for the master log.
+ *  3. Fill in API_KEY, ROOT_FOLDER_ID, MASTER_SHEET_ID below.
+ *  4. Enable Drive API v2 in Apps Script > Services.
+ *  5. Run processAllFolders() or use the menu.
+ */
+
+const API_KEY         = '';   // Gemini API key
+const ROOT_FOLDER_ID  = '';   // ID of the root Drive folder
+const MASTER_SHEET_ID = '';   // ID of the master Google Sheet
+
+// ─── UI ──────────────────────────────────────────────────────────────────────
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('🚀 Receipt Tools')
+    .addItem('Sync All Folders', 'processAllFolders')
+    .addToUi();
+}
+
+// ─── ENTRY POINT ─────────────────────────────────────────────────────────────
+
+function processAllFolders() {
+  const rootFolder  = DriveApp.getFolderById(ROOT_FOLDER_ID);
+  const masterSS    = SpreadsheetApp.openById(MASTER_SHEET_ID);
+  const masterSheet = masterSS.getActiveSheet();
+
+  ensureHeaders(masterSheet, EN_HEADERS);
+
+  // Load all already-processed file IDs into a Set for O(1) duplicate checks
+  const processedIds = loadProcessedIds(masterSS);
+
+  traverseFolders(rootFolder, masterSheet, masterSS, null, processedIds);
+  SpreadsheetApp.getUi().alert('✅ Sync Complete!');
+}
+
+// ─── HEADERS ─────────────────────────────────────────────────────────────────
+
+const EN_HEADERS = ['Date', 'Category', 'Vendor', 'Total', 'Tax', 'Currency', 'Link', 'File ID'];
+
+// ─── TRAVERSAL ───────────────────────────────────────────────────────────────
+
+function traverseFolders(currentFolder, masterSheet, masterSS, yearSheetId, processedIds) {
+  const folderName       = currentFolder.getName();
+  let   currentYearSheetId = yearSheetId;
+
+  if (folderName.includes('年')) {
+    currentYearSheetId = getOrCreateSheetInFolder(
+      currentFolder, `Tax Sheet ${folderName}`, EN_HEADERS
+    );
+  }
+
+  if (folderName.includes('月')) {
+    const monthSheetId = getOrCreateSheetInFolder(
+      currentFolder, `Tax Sheet ${folderName}`, EN_HEADERS
+    );
+    processFilesInMemory(
+      currentFolder, masterSheet, masterSS,
+      currentYearSheetId, monthSheetId, processedIds
+    );
+  }
+
+  const subfolders = currentFolder.getFolders();
+  while (subfolders.hasNext()) {
+    const sub = subfolders.next();
+    if (sub.getName() !== 'Processed') {
+      traverseFolders(sub, masterSheet, masterSS, currentYearSheetId, processedIds);
+    }
+  }
+}
+
+// ─── FILE PROCESSING ─────────────────────────────────────────────────────────
+
+function processFilesInMemory(folder, masterSheet, masterSS, yearSheetId, monthSheetId, processedIds) {
+  const allowedTypes = new Set([
+    'application/pdf',
+    'image/jpeg',
+    'image/png',
+    'text/plain',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  ]);
+
+  // Open target sheets ONCE per folder, not per file
+  const monthSS    = SpreadsheetApp.openById(monthSheetId);
+  const monthSheet = monthSS.getActiveSheet();
+  const yearSheet  = yearSheetId
+    ? SpreadsheetApp.openById(yearSheetId).getActiveSheet()
+    : null;
+
+  ensureHeaders(monthSheet, EN_HEADERS);
+  if (yearSheet) ensureHeaders(yearSheet, EN_HEADERS);
+
+  // Collect rows in memory; write once at the end (batch)
+  const masterRows = [];
+  const monthRows  = [];
+  const yearRows   = [];
+
+  const processedFolder = getProcessedSubFolder(folder);
+  const files = folder.getFiles();
+
+  while (files.hasNext()) {
+    const file     = files.next();
+    const fileId   = file.getId();
+    const mimeType = file.getMimeType();
+    const fileName = file.getName();
+
+    if (fileName.includes('Tax Sheet') || fileName === 'Processed') continue;
+    if (!allowedTypes.has(mimeType))                                  continue;
+
+    // ✅ Skip already-processed files (duplicate prevention)
+    if (processedIds.has(fileId)) {
+      console.log(`Skipping already-processed: ${fileName}`);
+      continue;
+    }
+
+    try {
+      console.log(`Processing: ${fileName}`);
+
+      let contentData;
+      if (mimeType === 'text/plain') {
+        contentData = { text: scrubText(file.getBlob().getDataAsString()) };
+      } else if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+        contentData = { text: scrubText(extractDocxText(fileId)) };
+      } else {
+        contentData = {
+          inline_data: {
+            mime_type: mimeType,
+            data: Utilities.base64Encode(file.getBlob().getBytes())
+          }
+        };
+      }
+
+      const data = callGeminiAI(contentData);
+
+      if (data) {
+        // Col 8 (fileId) stored in master only — used for duplicate detection
+        const masterRow = [data.date, data.category, data.vendor,
+                           data.total_amount, data.tax_amount, data.currency,
+                           file.getUrl(), fileId];
+        const subRow    = masterRow.slice(0, 7); // no fileId col in sub-sheets
+
+        masterRows.push(masterRow);
+        monthRows.push(subRow);
+        if (yearSheet) yearRows.push(subRow);
+
+        processedIds.add(fileId);         // mark in-memory immediately
+        file.moveTo(processedFolder);     // move right away to prevent re-queue
+        console.log(`Moved: ${fileName}`);
+      }
+
+      Utilities.sleep(1000); // respect Gemini RPM limits
+
+    } catch (err) {
+      console.error(`Error on ${fileName}: ${err}`);
+    }
+  }
+
+  // ✅ Batch write — one setValues() call instead of N appendRow() calls
+  batchAppend(masterSheet, masterRows);
+  batchAppend(monthSheet,  monthRows);
+  if (yearSheet && yearRows.length) batchAppend(yearSheet, yearRows);
+}
+
+// ─── GEMINI ──────────────────────────────────────────────────────────────────
+
+function callGeminiAI(contentPart) {
+  const modelId = 'gemini-3-flash-preview';
+  const url     = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${API_KEY}`;
+
+  const categories = 'Office Supplies, Travel, Meals & Entertainment, Advertising, Utilities, Rent, Software/Subscriptions, Repairs, Shipping, Contract Labor, Taxes and Licenses, Legal and Professional, Insurance';
+  const prompt     = `Return ONLY valid JSON with these exact keys: date (YYYY-MM-DD), category, vendor, total_amount (number), tax_amount (number), currency (ISO 4217 3-letter code). Allowed categories: ${categories}. Use null for any missing values. No markdown, no explanation, no extra text.`;
+
+  const payload = { contents: [{ parts: [{ text: prompt }, contentPart] }] };
+  const options = {
+    method: 'POST',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const res  = UrlFetchApp.fetch(url, options);
+  const json = JSON.parse(res.getContentText());
+
+  if (json.error) {
+    console.error(`Gemini Error: ${json.error.message}`);
+    return null;
+  }
+
+  try {
+    const text = json.candidates[0].content.parts[0].text;
+    return JSON.parse(text.replace(/```json|```/g, '').trim());
+  } catch (e) {
+    console.error(`JSON parse error: ${e}`);
+    return null;
+  }
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+/**
+ * Appends rows in a single setValues() call — much faster than appendRow() per row.
+ */
+function batchAppend(sheet, rows) {
+  if (!rows.length) return;
+  const lastRow = sheet.getLastRow();
+  sheet.getRange(lastRow + 1, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+/**
+ * Writes headers only if the sheet is completely empty.
+ */
+function ensureHeaders(sheet, headers) {
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headers);
+  }
+}
+
+/**
+ * Finds or creates a spreadsheet by name inside a specific folder.
+ * Scoped to that folder; removes ghost copies from My Drive root.
+ */
+function getOrCreateSheetInFolder(folder, sheetName, headers) {
+  const existing = folder.getFilesByName(sheetName);
+  if (existing.hasNext()) return existing.next().getId();
+
+  const newSS   = SpreadsheetApp.create(sheetName);
+  const newFile = DriveApp.getFileById(newSS.getId());
+  newFile.moveTo(folder);
+
+  // Remove from My Drive root to avoid ghost copies
+  const parents = newFile.getParents();
+  while (parents.hasNext()) {
+    const p = parents.next();
+    if (p.getId() !== folder.getId()) newFile.removeFromFolder(p);
+  }
+
+  newSS.getActiveSheet().appendRow(headers);
+  return newSS.getId();
+}
+
+/**
+ * Loads previously-processed file IDs from master sheet col 8 into a Set.
+ */
+function loadProcessedIds(masterSS) {
+  const sheet   = masterSS.getActiveSheet();
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return new Set();
+  const ids = sheet.getRange(2, 8, lastRow - 1, 1).getValues();
+  return new Set(ids.map(r => r[0]).filter(Boolean));
+}
+
+function getProcessedSubFolder(parent) {
+  const folders = parent.getFoldersByName('Processed');
+  return folders.hasNext() ? folders.next() : parent.createFolder('Processed');
+}
+
+function extractDocxText(fileId) {
+  const file     = DriveApp.getFileById(fileId);
+  const resource = { title: `Temp_${file.getName()}`, mimeType: MimeType.GOOGLE_DOCS };
+  const tempFile = Drive.Files.copy(resource, fileId);
+  const doc      = DocumentApp.openById(tempFile.id);
+  const text     = doc.getBody().getText();
+  Drive.Files.remove(tempFile.id);
+  return text;
+}
+
+function scrubText(text) {
+  return text
+    ? text
+        .replace(/\b\d{3}-\d{2}-\d{4}\b/g,             '[SSN]')
+        .replace(/\b(?:\d[ -]*?){13,16}\b/g,            '[CARD]')
+        .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[EMAIL]')
+    : '';
+}
